@@ -1,0 +1,12 @@
+{
+    "display_name": "Nemo Rewrite",
+    "author": "NemoVonNirgend",
+    "version": "0.1.0",
+    "description": "Selection-based rewriting, shortening, expansion, custom editing, deletion, undo, and optional NemoLore preference evidence.",
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "homePage": "https://github.com/NemoVonNirgend/NemoRewrite",
+    "loading_order": 1000
+}
