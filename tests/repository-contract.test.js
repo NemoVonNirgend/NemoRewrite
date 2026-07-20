@@ -27,4 +27,6 @@ test('runtime guards assistant edits, concurrent message changes, and stale abor
     assert.match(source, /controller\.signal\.aborted/);
     assert.match(source, /abortController\?\.abort\(\)/);
     assert.match(source, /Undo skipped because this message changed after the rewrite/);
+    assert.match(source, /previousRewriteRuntime\?\.cleanup\?\.\(\)/);
+    assert.match(source, /standalone: true/);
 });

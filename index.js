@@ -1294,6 +1294,8 @@ export async function initNemoRewrite() {
         registerEventHandler(event_types.MESSAGE_EDITED, removeUndoButton);
 
         window.NemoRewrite = {
+            standalone: true,
+            initializing: false,
             getSettings,
             isStandaloneRewriteDetected,
             isNativeMenuSuppressed,
@@ -1321,4 +1323,10 @@ export function cleanupNemoRewrite() {
     initialized = false;
 }
 
-initNemoRewrite().catch(error => logger.error('Failed to initialize', error));
+const previousRewriteRuntime = window.NemoRewrite;
+if (previousRewriteRuntime?.standalone !== true) previousRewriteRuntime?.cleanup?.();
+window.NemoRewrite = { standalone: true, initializing: true };
+initNemoRewrite().catch(error => {
+    if (window.NemoRewrite?.standalone && window.NemoRewrite?.initializing) delete window.NemoRewrite;
+    logger.error('Failed to initialize', error);
+});
