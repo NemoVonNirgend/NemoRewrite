@@ -19,6 +19,7 @@ import { callGenericPopup, POPUP_RESULT, POPUP_TYPE } from '../../../popup.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { getRegexedString, regex_placement } from '../../regex/engine.js';
 import logger from './logger.js';
+import { createStandaloneSettings, replaceSelectionIfCurrent } from './src/rewrite-core.js';
 
 const FEATURE_PATH = 'scripts/extensions/third-party/NemoRewrite';
 const FEATURE_SETTINGS_KEY = 'NemoRewrite';
@@ -94,19 +95,18 @@ let registeredEventHandlers = [];
 
 function getSettings() {
     const legacy = extension_settings.NemoPresetExt?.rewrite;
-    const hadStandaloneSettings = Boolean(extension_settings[FEATURE_SETTINGS_KEY]);
-    const existing = extension_settings[FEATURE_SETTINGS_KEY] || (legacy ? { ...legacy, _migratedFromNemoPresetExt: true } : {});
+    const resolved = createStandaloneSettings({ current: extension_settings[FEATURE_SETTINGS_KEY], legacy, defaults: DEFAULT_SETTINGS });
+    const existing = resolved.settings;
     if (existing._noteActionHiddenByDefaultV1 !== true) {
         existing.showNoteAction = false;
         existing._noteActionHiddenByDefaultV1 = true;
     }
     const merged = {
-        ...DEFAULT_SETTINGS,
         ...existing,
         noteHistory: Array.isArray(existing.noteHistory) ? existing.noteHistory : [],
     };
     extension_settings[FEATURE_SETTINGS_KEY] = merged;
-    if (!hadStandaloneSettings) saveSettingsDebounced();
+    if (resolved.created) saveSettingsDebounced();
     return merged;
 }
 
@@ -350,7 +350,8 @@ function processSelection() {
     const startMesText = findClosestMesText(range.startContainer);
     const endMesText = findClosestMesText(range.endContainer);
     if (!startMesText || !endMesText || startMesText !== endMesText) return;
-    if (!findMessageDiv(startMesText)) return;
+    const messageDiv = findMessageDiv(startMesText);
+    if (!messageDiv || !isEditableAssistantMessage(messageDiv.getAttribute('mesid'))) return;
     createRewriteMenu();
 }
 
@@ -444,8 +445,13 @@ function getCurrentSelectionInfo() {
     if (!mesTextElement || !messageDiv) return null;
     const mesId = messageDiv.getAttribute('mesid');
     const swipeId = messageDiv.getAttribute('swipeid') ?? undefined;
-    if (mesId === null) return null;
+    if (mesId === null || !isEditableAssistantMessage(mesId)) return null;
     return getSelectedTextInfo(mesId, swipeId, mesTextElement, range);
+}
+
+function isEditableAssistantMessage(mesId) {
+    const message = getContext().chat?.[mesId];
+    return Boolean(message && !message.is_user && !message.is_system);
 }
 
 async function handleNoteFlow(selectionInfo) {
@@ -542,7 +548,14 @@ async function runRewriteAction(actionKey, selectionInfo, options = {}) {
 
 async function handleDeleteSelection(selectionInfo, note = '') {
     const { mesId, swipeId, fullMessage, rawStartOffset, rawEndOffset, selectedRawText } = selectionInfo;
-    const newMessage = fullMessage.slice(0, rawStartOffset) + fullMessage.slice(rawEndOffset);
+    const newMessage = replaceSelectionIfCurrent({
+        expectedContent: fullMessage,
+        currentContent: getCurrentMessageContent(mesId, swipeId),
+        start: rawStartOffset,
+        end: rawEndOffset,
+        replacement: '',
+    });
+    if (newMessage === null) return reportEditConflict();
     saveLastChange(mesId, swipeId, fullMessage, newMessage, {
         action: 'Delete',
         note,
@@ -576,23 +589,28 @@ async function handleChatCompletionRewrite(selectionInfo, actionKey, customInstr
     const mesDiv = document.querySelector(`[mesid="${CSS.escape(selectionInfo.mesId)}"] .mes_text`);
     if (!mesDiv) return;
 
-    abortController = createAbortController(mesDiv, selectionInfo.mesId, selectionInfo.swipeId);
+    const controller = createAbortController(mesDiv, selectionInfo.mesId, selectionInfo.swipeId);
+    abortController?.abort();
+    abortController = controller;
     getContext().deactivateSendButtons();
     let response;
     try {
         response = await sendOpenAIRequest('normal', [
             { role: 'system', content: 'You are a precise text rewriter. Output only the rewritten text - no preface, no commentary, no quotes.' },
             { role: 'user', content: prompt },
-        ], abortController.signal);
+        ], controller.signal);
     } catch (error) {
-        if (!abortController.signal.aborted) {
+        if (!controller.signal.aborted) {
             logger.error('Nemo Rewrite OpenAI request failed', error);
             toastr.error('Rewrite failed. Check the console for details.', 'Nemo Rewrite');
         }
     } finally {
-        getContext().activateSendButtons();
+        if (abortController === controller) {
+            abortController = null;
+            getContext().activateSendButtons();
+        }
     }
-    if (response === undefined) return;
+    if (response === undefined || controller.signal.aborted) return;
     await processRewriteResponse(response, selectionInfo, selectionInfo.range, selectionInfo.fullMessage, selectionInfo.rawStartOffset, selectionInfo.rawEndOffset, actionKey, note, mesDiv);
 }
 
@@ -621,24 +639,26 @@ async function handleTextBasedRewrite(selectionInfo, actionKey, customInstructio
             return;
     }
 
-    abortController = createAbortController(mesDiv, selectionInfo.mesId, selectionInfo.swipeId);
+    const controller = createAbortController(mesDiv, selectionInfo.mesId, selectionInfo.swipeId);
+    abortController?.abort();
+    abortController = controller;
     getContext().deactivateSendButtons();
     let response;
     try {
         if (getSettings().useStreaming) {
             switch (main_api) {
                 case 'textgenerationwebui':
-                    response = await generateTextGenWithStreaming(generateData, abortController.signal);
+                    response = await generateTextGenWithStreaming(generateData, controller.signal);
                     break;
                 case 'novel':
-                    response = await generateNovelWithStreaming(generateData, abortController.signal);
+                    response = await generateNovelWithStreaming(generateData, controller.signal);
                     break;
                 default:
                     toastr.warning('Streaming is not supported for the active backend. Disable streaming in Nemo Rewrite settings.', 'Nemo Rewrite');
                     return;
             }
         } else if (main_api === 'koboldhorde') {
-            response = await generateHorde(prompt, generateData, abortController.signal, true);
+            response = await generateHorde(prompt, generateData, controller.signal, true);
         } else {
             const text = await generateRaw({
                 prompt,
@@ -647,15 +667,18 @@ async function handleTextBasedRewrite(selectionInfo, actionKey, customInstructio
             response = { text };
         }
     } catch (error) {
-        if (!abortController.signal.aborted) {
+        if (!controller.signal.aborted) {
             logger.error('Nemo Rewrite text request failed', error);
             toastr.error('Rewrite failed. Check the console for details.', 'Nemo Rewrite');
         }
     } finally {
-        getContext().activateSendButtons();
+        if (abortController === controller) {
+            abortController = null;
+            getContext().activateSendButtons();
+        }
     }
 
-    if (response === undefined) return;
+    if (response === undefined || controller.signal.aborted) return;
     await processRewriteResponse(response, selectionInfo, selectionInfo.range, selectionInfo.fullMessage, selectionInfo.rawStartOffset, selectionInfo.rawEndOffset, actionKey, note, mesDiv);
 }
 
@@ -670,8 +693,10 @@ function createAbortController(mesDiv, mesId, swipeId) {
 
 function handleStopRewrite() {
     if (!abortController) return;
-    const { mesDiv, mesId, swipeId, highlightDuration } = abortController.signal;
-    abortController.abort();
+    const controller = abortController;
+    abortController = null;
+    const { mesDiv, mesId, swipeId, highlightDuration } = controller.signal;
+    controller.abort();
     getContext().activateSendButtons();
     setTimeout(() => removeHighlight(mesDiv, mesId, swipeId), highlightDuration || DEFAULT_SETTINGS.highlightDuration);
 }
@@ -814,7 +839,14 @@ async function saveRewrittenText(selectionInfo, fullMessage, startOffset, endOff
         processedText = getRegexedString(processedText, regex_placement.AI_OUTPUT);
     }
 
-    const newMessage = fullMessage.substring(0, startOffset) + processedText + fullMessage.substring(endOffset);
+    const newMessage = replaceSelectionIfCurrent({
+        expectedContent: fullMessage,
+        currentContent: getCurrentMessageContent(selectionInfo.mesId, selectionInfo.swipeId),
+        start: startOffset,
+        end: endOffset,
+        replacement: processedText,
+    });
+    if (newMessage === null) return reportEditConflict();
     saveLastChange(selectionInfo.mesId, selectionInfo.swipeId, fullMessage, newMessage, {
         action: ACTIONS[actionKey]?.label || actionKey,
         note,
@@ -956,9 +988,19 @@ async function handleUndo(event) {
     if (!mesId) return;
     const change = [...changeHistory].reverse().find(item => item.mesId === mesId);
     if (!change) return;
+    if (getCurrentMessageContent(change.mesId, change.swipeId) !== change.newContent) return reportEditConflict('Undo skipped because this message changed after the rewrite.');
     await updateMessageContent(change.mesId, change.swipeId, change.originalContent);
     changeHistory = changeHistory.filter(item => item !== change);
     updateUndoButtons();
+}
+
+function getCurrentMessageContent(mesId, swipeId) {
+    return getMessageContent(getContext().chat?.[mesId], swipeId);
+}
+
+function reportEditConflict(message = 'Rewrite skipped because this message changed while the edit was being prepared.') {
+    toastr.warning(message, 'Nemo Rewrite');
+    return false;
 }
 
 async function removeHighlight(mesDiv, mesId, swipeId) {
@@ -1267,6 +1309,9 @@ export async function initNemoRewrite() {
 
 export function cleanupNemoRewrite() {
     clearTimeout(selectionTimer);
+    abortController?.abort();
+    abortController = null;
+    getContext()?.activateSendButtons?.();
     removeAllHandlers();
     removeRewriteMenu();
     document.querySelectorAll(`.${UNDO_BUTTON_CLASS}`).forEach(button => button.remove());

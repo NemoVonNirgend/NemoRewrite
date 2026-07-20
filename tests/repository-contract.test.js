@@ -18,3 +18,13 @@ test('runtime uses standalone paths and preserves a legacy migration source', as
     assert.match(source, /extension_settings\.NemoPresetExt\?\.rewrite/);
     assert.doesNotMatch(source, /third-party\/NemoPresetExt\/features\/rewrite/);
 });
+
+test('runtime guards assistant edits, concurrent message changes, and stale abort controllers', async () => {
+    const source = await read('index.js');
+    assert.match(source, /!message\.is_user && !message\.is_system/);
+    assert.match(source, /replaceSelectionIfCurrent/);
+    assert.match(source, /if \(abortController === controller\) \{[\s\S]*?abortController = null/);
+    assert.match(source, /controller\.signal\.aborted/);
+    assert.match(source, /abortController\?\.abort\(\)/);
+    assert.match(source, /Undo skipped because this message changed after the rewrite/);
+});
